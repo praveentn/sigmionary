@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import discord
-from discord import Option, SlashCommandGroup
+from discord import SlashCommandGroup
 from discord.ext import commands
 
 from utils import database as db
@@ -96,11 +96,8 @@ class GameCog(commands.Cog):
     # /sigmionary start ───────────────────────────────────────────────────────
 
     @sigmionary.command(name="start", description="Start a Sigmionary game in this channel")
-    async def cmd_start(
-        self,
-        ctx: discord.ApplicationContext,
-        rounds: Option(int, "Number of rounds to play (0 = all questions)", required=False, default=0) = 0,
-    ) -> None:
+    @discord.option("rounds", description="Number of rounds to play (0 = all questions)", input_type=int, required=False, default=0)
+    async def cmd_start(self, ctx: discord.ApplicationContext, rounds: int = 0) -> None:
         guild_id = ctx.guild_id
         state    = self._state(guild_id)
 
@@ -255,11 +252,8 @@ class GameCog(commands.Cog):
     # /sigmionary stats ───────────────────────────────────────────────────────
 
     @sigmionary.command(name="stats", description="View your stats (or another player's)")
-    async def cmd_stats(
-        self,
-        ctx: discord.ApplicationContext,
-        user: Option(discord.Member, "Player to look up (default: yourself)", required=False) = None,
-    ) -> None:
+    @discord.option("user", description="Player to look up (default: yourself)", input_type=discord.Member, required=False)
+    async def cmd_stats(self, ctx: discord.ApplicationContext, user: discord.Member = None) -> None:
         await ctx.defer()
         target   = user or ctx.author
         guild_id = ctx.guild_id
