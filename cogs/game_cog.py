@@ -9,6 +9,7 @@ state lookup is keyed by guild_id.
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import random
 import time
@@ -20,7 +21,7 @@ from discord import SlashCommandGroup
 from discord.ext import commands
 
 from utils import database as db
-from utils.fuzzy_match import is_correct_answer
+from utils.fuzzy_match import guess_score, is_correct_answer, THRESHOLD_HOT, THRESHOLD_WARM
 from utils.questions import load_questions
 
 log = logging.getLogger("sigmionary")
@@ -383,18 +384,20 @@ class GameCog(commands.Cog):
     async def _hint_loop(
         self, channel: discord.TextChannel, guild_id: int, token: int
     ) -> None:
-        """Reveal images one by one, then trigger timeout if unanswered."""
-        state = self._state(guild_id)
-        q     = state.current_q
+        """Reveal images one by one (side-by-side), then trigger timeout if unanswered."""
+        state    = self._state(guild_id)
+        q        = state.current_q
+        revealed: list[Path] = []
 
         for idx, img_path in enumerate(q["images"]):
             if not state.active or state.q_token != token:
                 return
 
+            revealed.append(img_path)
             state.hint_level      = idx + 1
             state.hint_start_time = time.time()
 
-            await self._send_hint(channel, q, img_path, state.hint_level, len(q["images"]))
+            await self._send_hints(channel, q, revealed, state.hint_level, len(q["images"]))
 
             try:
                 await asyncio.sleep(HINT_INTERVAL)
@@ -405,34 +408,40 @@ class GameCog(commands.Cog):
         if state.active and state.q_token == token and not state.q_answered:
             await self._on_timeout(channel, guild_id, token)
 
-    async def _send_hint(
+    async def _send_hints(
         self,
         channel: discord.TextChannel,
         q: dict,
-        img_path: Path,
+        revealed: list[Path],
         hint_num: int,
         total_hints: int,
     ) -> None:
+        """Send all revealed images stitched side-by-side in a single embed."""
         embed = discord.Embed(
             description=f"**Category:** {q['category']}  |  **Sub-category:** {q['subcategory']}",
             color=discord.Color.og_blurple(),
         )
         embed.set_author(name=f"Hint {hint_num} / {total_hints}")
-        embed.set_image(url=f"attachment://{img_path.name}")
         embed.set_footer(text=f"You have {HINT_INTERVAL}s — type your answer in chat!")
 
+        buf = _stitch_images(revealed)
+        if buf:
+            embed.set_image(url="attachment://hints.png")
+            await channel.send(file=discord.File(buf, filename="hints.png"), embed=embed)
+            return
+
+        # Fallback: send each image as a separate attachment in one message
         try:
-            with open(img_path, "rb") as f:
-                discord_file = discord.File(f, filename=img_path.name)
-            await channel.send(file=discord_file, embed=embed)
+            handles = [open(p, "rb") for p in revealed]
+            files   = [discord.File(h, filename=p.name) for h, p in zip(handles, revealed)]
+            await channel.send(files=files, embed=embed)
+            for h in handles:
+                h.close()
         except Exception as exc:
-            log.error("Failed to send hint image %s: %s", img_path, exc)
-            await channel.send(
-                embed=discord.Embed(
-                    description=f"*(Image unavailable: `{img_path.name}`)*",
-                    color=discord.Color.greyple(),
-                )
-            )
+            log.error("Failed to send hint images: %s", exc)
+            await channel.send(embed=discord.Embed(
+                description="*(Images unavailable)*", color=discord.Color.greyple()
+            ))
 
     async def _on_timeout(
         self, channel: discord.TextChannel, guild_id: int, token: int
@@ -528,7 +537,23 @@ class GameCog(commands.Cog):
             return
 
         answer = state.current_q["item"]
-        if not is_correct_answer(message.content, answer):
+        score  = guess_score(message.content, answer)
+
+        # ── Near-miss feedback — react to tell the player how close they are ──
+        if score < THRESHOLD_HOT:
+            if score >= THRESHOLD_WARM:
+                # In the right ballpark but not close enough
+                try:
+                    await message.add_reaction("🌡️")
+                except discord.HTTPException:
+                    pass
+            return  # not correct, nothing more to do
+
+        if score < 82:  # HOT but not correct yet
+            try:
+                await message.add_reaction("🔥")
+            except discord.HTTPException:
+                pass
             return
 
         # ── Correct! acquire lock to prevent simultaneous accepts ─────────────
@@ -574,6 +599,10 @@ class GameCog(commands.Cog):
                 ),
                 color=discord.Color.green(),
             )
+            try:
+                await message.add_reaction("✅")
+            except discord.HTTPException:
+                pass
             await message.channel.send(embed=embed)
 
             # Cancel hint loop
@@ -583,6 +612,52 @@ class GameCog(commands.Cog):
         # Advance outside the lock (we don't want to hold it over I/O)
         await asyncio.sleep(BETWEEN_Q_DELAY)
         await self._advance(message.channel, guild_id, token)
+
+
+# ── Image stitching ───────────────────────────────────────────────────────────
+
+_TARGET_HEIGHT = 300   # px — all images normalised to this height
+_GAP           = 12    # px — gap between images
+_BG_COLOR      = (47, 49, 54)  # Discord dark-mode background
+
+
+def _stitch_images(paths: list[Path]) -> io.BytesIO | None:
+    """
+    Resize each image to _TARGET_HEIGHT (preserving aspect ratio) then place
+    them side-by-side on a single canvas.  Returns a PNG BytesIO, or None if
+    Pillow is unavailable or any error occurs (caller falls back to individual files).
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        log.warning("Pillow not installed — falling back to individual image files.")
+        return None
+
+    try:
+        frames: list[Image.Image] = []
+        for p in paths:
+            with Image.open(p) as raw:
+                img = raw.convert("RGBA")
+                ratio   = _TARGET_HEIGHT / img.height
+                new_w   = max(1, int(img.width * ratio))
+                frames.append(img.resize((new_w, _TARGET_HEIGHT), Image.LANCZOS))
+
+        total_w = sum(f.width for f in frames) + _GAP * (len(frames) - 1)
+        canvas  = Image.new("RGBA", (total_w, _TARGET_HEIGHT), (*_BG_COLOR, 255))
+
+        x = 0
+        for frame in frames:
+            canvas.paste(frame, (x, 0), frame)   # alpha-aware paste
+            x += frame.width + _GAP
+
+        buf = io.BytesIO()
+        canvas.convert("RGB").save(buf, "PNG", optimize=True)
+        buf.seek(0)
+        return buf
+
+    except Exception as exc:
+        log.warning("_stitch_images failed: %s", exc)
+        return None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
