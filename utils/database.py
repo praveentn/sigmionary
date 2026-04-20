@@ -44,6 +44,13 @@ CREATE TABLE IF NOT EXISTS user_stats (
     PRIMARY KEY (guild_id, user_id)
 );
 
+CREATE TABLE IF NOT EXISTS guild_question_seen (
+    guild_id    INTEGER NOT NULL,
+    question_id TEXT    NOT NULL,
+    seen_at     REAL    NOT NULL,
+    PRIMARY KEY (guild_id, question_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_round_guild ON round_answers (guild_id, session_id);
 CREATE INDEX IF NOT EXISTS idx_stats_guild ON user_stats (guild_id, total_points DESC);
 """
@@ -147,6 +154,37 @@ async def get_user_stats(guild_id: int, user_id: int) -> dict | None:
         )
         row = await cur.fetchone()
     return dict(row) if row else None
+
+
+async def get_seen_question_ids(guild_id: int) -> set[str]:
+    """Return the set of question IDs already shown in this guild."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT question_id FROM guild_question_seen WHERE guild_id = ?",
+            (guild_id,),
+        )
+        rows = await cur.fetchall()
+    return {r[0] for r in rows}
+
+
+async def mark_question_seen(guild_id: int, question_id: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT OR IGNORE INTO guild_question_seen (guild_id, question_id, seen_at)
+               VALUES (?, ?, ?)""",
+            (guild_id, question_id, time.time()),
+        )
+        await db.commit()
+
+
+async def reset_seen_questions(guild_id: int) -> None:
+    """Clear the seen history for a guild so all questions become available again."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM guild_question_seen WHERE guild_id = ?",
+            (guild_id,),
+        )
+        await db.commit()
 
 
 async def get_user_rank(guild_id: int, user_id: int) -> int | None:

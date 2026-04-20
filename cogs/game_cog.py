@@ -113,10 +113,18 @@ class GameCog(commands.Cog):
             await ctx.respond("No questions found. Check the `questions/` folder.", ephemeral=True)
             return
 
-        pool = list(self._questions)
-        random.shuffle(pool)
-        if rounds and 0 < rounds < len(pool):
-            pool = pool[:rounds]
+        # ── Build unseen question pool (per-guild rotation) ───────────────────
+        seen_ids = await db.get_seen_question_ids(guild_id)
+        unseen   = [q for q in self._questions if q["id"] not in seen_ids]
+
+        fresh_start = False
+        if not unseen:
+            await db.reset_seen_questions(guild_id)
+            unseen      = list(self._questions)
+            fresh_start = True
+
+        random.shuffle(unseen)
+        pool = unseen[:rounds] if rounds and 0 < rounds < len(unseen) else unseen
 
         # Initialise state
         state.active         = True
@@ -130,6 +138,7 @@ class GameCog(commands.Cog):
         state.q_token        = 0
         state.session_id     = await db.create_session(guild_id, ctx.author.id)
 
+        fresh_note = "\n\nAll questions completed — starting a **fresh rotation**!" if fresh_start else ""
         embed = discord.Embed(
             title="Sigmionary — Game Starting!",
             description=(
@@ -140,7 +149,7 @@ class GameCog(commands.Cog):
                 "Hint 3 correct → **40 pts**\n\n"
                 "**Streak multipliers** — consecutive correct answers:\n"
                 "2 streak → **×1.2** | 3 streak → **×1.5** | 5 streak → **×2.0**\n\n"
-                "Get ready — first question dropping in **3 seconds!**"
+                f"Get ready — first question dropping in **3 seconds!**{fresh_note}"
             ),
             color=discord.Color.gold(),
         )
@@ -352,12 +361,15 @@ class GameCog(commands.Cog):
             return
 
         q               = state.questions[state.current_idx]
-        state.current_q = q
-        state.hint_level    = 0
-        state.q_answered    = False
+        state.current_q       = q
+        state.hint_level      = 0
+        state.q_answered      = False
         state.hint_start_time = 0.0
-        state.q_token      += 1
+        state.q_token        += 1
         token = state.q_token
+
+        # Mark seen the moment it's shown so it won't repeat even if game is stopped
+        asyncio.create_task(db.mark_question_seen(guild_id, q["id"]))
 
         n_total = len(state.questions)
         n_hints = len(q["images"])
