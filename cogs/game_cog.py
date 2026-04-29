@@ -21,8 +21,8 @@ from discord import SlashCommandGroup
 from discord.ext import commands
 
 from utils import database as db
+from utils.database import load_questions
 from utils.fuzzy_match import guess_score, is_correct_answer, THRESHOLD_HOT, THRESHOLD_WARM
-from utils.questions import load_questions
 
 log = logging.getLogger("sigmionary")
 
@@ -73,10 +73,9 @@ class _GameState:
 
 class GameCog(commands.Cog):
     def __init__(self, bot: discord.Bot) -> None:
-        self.bot       = bot
-        self._questions: list[dict] = load_questions()
-        self._states:   dict[int, _GameState]    = {}
-        self._locks:    dict[int, asyncio.Lock]  = {}
+        self.bot     = bot
+        self._states: dict[int, _GameState]   = {}
+        self._locks:  dict[int, asyncio.Lock] = {}
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -109,18 +108,19 @@ class GameCog(commands.Cog):
             )
             return
 
-        if not self._questions:
-            await ctx.respond("No questions found. Check the `questions/` folder.", ephemeral=True)
+        questions = await load_questions(guild_id)
+        if not questions:
+            await ctx.respond("No questions found. Add some with the dev command or run the migration.", ephemeral=True)
             return
 
         # ── Build unseen question pool (per-guild rotation) ───────────────────
         seen_ids = await db.get_seen_question_ids(guild_id)
-        unseen   = [q for q in self._questions if q["id"] not in seen_ids]
+        unseen   = [q for q in questions if q["id"] not in seen_ids]
 
         fresh_start = False
         if not unseen:
             await db.reset_seen_questions(guild_id)
-            unseen      = list(self._questions)
+            unseen      = list(questions)
             fresh_start = True
 
         random.shuffle(unseen)
