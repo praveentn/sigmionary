@@ -39,7 +39,7 @@ asyncio.set_event_loop(asyncio.new_event_loop())
 intents                 = discord.Intents.default()
 intents.message_content = True   # Privileged intent — enable in Discord Developer Portal
 
-bot = discord.Bot(intents=intents, debug_guilds=DEBUG_GUILDS, command_prefix="!")
+bot = commands.Bot(intents=intents, debug_guilds=DEBUG_GUILDS, command_prefix="!")
 
 COGS = [
     "cogs.game_cog",
