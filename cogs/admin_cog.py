@@ -1,11 +1,11 @@
 """
 admin_cog.py — Developer-only puzzle management commands.
 
-Uses prefix commands (!) so they never appear in Discord's slash command menu.
-Access is restricted to Discord user IDs listed in DEVELOPER_IDS (env var).
+Triggered by a plain chat message: !addpuzzle
+Handled via on_message (not the commands framework) so it never appears
+in Discord's slash-command menu and doesn't require prefix-command support.
 
-Usage:
-    !addpuzzle   — interactive wizard to add a new puzzle with images
+Access is restricted to Discord user IDs listed in DEVELOPER_IDS (env var).
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ log = logging.getLogger("sigmionary")
 _IMG_EXTS     = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 _STEP_TIMEOUT = 120   # seconds for view interactions (select / buttons)
 _IMG_TIMEOUT  = 300   # seconds of inactivity before image upload session expires
+_TRIGGER      = "!addpuzzle"
 
 # Comma-separated Discord user IDs: DEVELOPER_IDS=123456789,987654321
 _raw_ids = os.getenv("DEVELOPER_IDS", "")
@@ -38,8 +39,8 @@ DEVELOPER_IDS: frozenset[int] = frozenset(
 
 class _ChoiceView(discord.ui.View):
     """
-    Shows a Select with existing choices + '+ New …' option, and a Cancel button.
-    After stop(): check .chosen (str), .new_requested (bool), .cancelled (bool).
+    Select with existing choices + '+ New …' option, plus a Cancel button.
+    After wait(): check .chosen (str), .new_requested (bool), .cancelled (bool).
     """
 
     def __init__(self, existing: list[str], noun: str) -> None:
@@ -95,51 +96,55 @@ class _ConfirmView(discord.ui.View):
 
 class AdminCog(commands.Cog):
     def __init__(self, bot: discord.Bot) -> None:
-        self.bot              = bot
+        self.bot             = bot
         self._active: set[int] = set()   # user IDs with an open session
 
-    # ── Guard ─────────────────────────────────────────────────────────────────
+    # ── Trigger listener ──────────────────────────────────────────────────────
 
-    def _msg_check(self, ctx: commands.Context):
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        if message.author.bot or not message.guild:
+            return
+        if message.author.id not in DEVELOPER_IDS:
+            return
+        if message.content.strip().lower() != _TRIGGER:
+            return
+
+        if message.author.id in self._active:
+            await message.channel.send("You already have an active session. Finish it first.")
+            return
+
+        self._active.add(message.author.id)
+        try:
+            await self._wizard(message)
+        except Exception as exc:
+            log.error("!addpuzzle crashed: %s", exc, exc_info=True)
+            await message.channel.send(f"Unexpected error: `{exc}`")
+        finally:
+            self._active.discard(message.author.id)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _msg_check(self, message: discord.Message):
         """wait_for check: same author + same channel, not a bot."""
         def check(m: discord.Message) -> bool:
             return (
-                m.author.id  == ctx.author.id
-                and m.channel.id == ctx.channel.id
+                m.author.id  == message.author.id
+                and m.channel.id == message.channel.id
                 and not m.author.bot
             )
         return check
 
-    # ── !addpuzzle ────────────────────────────────────────────────────────────
-
-    @commands.command(name="addpuzzle")
-    async def add_puzzle(self, ctx: commands.Context) -> None:
-        # Silently ignore everyone who isn't a developer
-        if ctx.author.id not in DEVELOPER_IDS:
-            return
-
-        if ctx.guild is None:
-            await ctx.send("Run this command inside a server.")
-            return
-
-        if ctx.author.id in self._active:
-            await ctx.send("You already have an active session. Finish it first.")
-            return
-
-        self._active.add(ctx.author.id)
-        try:
-            await self._wizard(ctx)
-        except Exception as exc:
-            log.error("!addpuzzle crashed: %s", exc, exc_info=True)
-            await ctx.send(f"Unexpected error: `{exc}`")
-        finally:
-            self._active.discard(ctx.author.id)
-
     # ── Wizard ────────────────────────────────────────────────────────────────
 
-    async def _wizard(self, ctx: commands.Context) -> None:
-        guild_id = ctx.guild.id
-        check    = self._msg_check(ctx)
+    async def _wizard(self, trigger: discord.Message) -> None:
+        channel  = trigger.channel
+        author   = trigger.author
+        guild_id = trigger.guild.id
+        check    = self._msg_check(trigger)
+
+        async def send(*args, **kwargs):
+            return await channel.send(*args, **kwargs)
 
         # ── Step 1: Category ──────────────────────────────────────────────────
         categories = await db.get_categories(guild_id)
@@ -151,12 +156,7 @@ class AdminCog(commands.Cog):
             embed.description = "No categories yet — you'll create the first one."
 
         view = _ChoiceView(categories, "Category")
-
-        if not categories:
-            # No existing choices — skip the view, go straight to text prompt
-            view.new_requested = True
-
-        msg = await ctx.send(embed=embed, view=view if categories else None)
+        msg  = await send(embed=embed, view=view if categories else None)
 
         if categories:
             await view.wait()
@@ -164,7 +164,7 @@ class AdminCog(commands.Cog):
                 await msg.edit(content="Cancelled.", embed=None, view=None)
                 return
 
-        if view.new_requested:
+        if not categories or view.new_requested:
             await msg.edit(
                 embed=discord.Embed(description="Type the **new category name**:", color=discord.Color.blurple()),
                 view=None,
@@ -197,10 +197,6 @@ class AdminCog(commands.Cog):
             )
 
         view2 = _ChoiceView(subcategories, "Sub-category")
-
-        if not subcategories:
-            view2.new_requested = True
-
         await msg.edit(embed=embed2, view=view2 if subcategories else None)
 
         if subcategories:
@@ -209,7 +205,7 @@ class AdminCog(commands.Cog):
                 await msg.edit(content="Cancelled.", embed=None, view=None)
                 return
 
-        if view2.new_requested:
+        if not subcategories or view2.new_requested:
             await msg.edit(
                 embed=discord.Embed(
                     description=f"Category: **{category}**\nType the **new sub-category name**:",
@@ -269,62 +265,55 @@ class AdminCog(commands.Cog):
             view=None,
         )
 
-        # Collect (position, original_filename, bytes) in memory
-        images_data: list[tuple[int, str, bytes]] = []
+        images_data: list[tuple[int, str, bytes]] = []   # (position, filename, bytes)
 
         while True:
             try:
                 img_msg = await self.bot.wait_for("message", timeout=_IMG_TIMEOUT, check=check)
             except asyncio.TimeoutError:
-                await ctx.send("Session timed out — cancelled. Nothing was saved.")
+                await send("Session timed out — cancelled. Nothing was saved.")
                 return
 
             text = img_msg.content.strip().lower()
 
             if text == "cancel":
-                await ctx.send("Cancelled — nothing was saved.")
+                await send("Cancelled — nothing was saved.")
                 return
 
             if text == "done":
                 break
 
             if not img_msg.attachments:
-                await ctx.send("No attachment found. Send an image file, or type `done` / `cancel`.")
+                await send("No attachment found. Send an image file, or type `done` / `cancel`.")
                 continue
 
             att = img_msg.attachments[0]
             ext = Path(att.filename).suffix.lower()
             if ext not in _IMG_EXTS:
-                await ctx.send(
-                    f"Unsupported format `{ext}`. Accepted: {', '.join(sorted(_IMG_EXTS))}"
-                )
+                await send(f"Unsupported format `{ext}`. Accepted: {', '.join(sorted(_IMG_EXTS))}")
                 continue
 
             img_bytes = await att.read()
             pos = len(images_data) + 1
             images_data.append((pos, att.filename, img_bytes))
             await img_msg.add_reaction("✅")
-            await ctx.send(f"Image {pos} saved. Send the next image or type `done`.")
+            await send(f"Image {pos} saved. Send the next image or type `done`.")
 
         if not images_data:
-            await ctx.send("No images provided — cancelled. Nothing was saved.")
+            await send("No images provided — cancelled. Nothing was saved.")
             return
 
         # ── Confirm ───────────────────────────────────────────────────────────
         confirm_embed = discord.Embed(title="Confirm New Puzzle", color=discord.Color.gold())
-        confirm_embed.add_field(name="Category",     value=category,                 inline=True)
-        confirm_embed.add_field(name="Sub-category", value=subcategory,              inline=True)
-        confirm_embed.add_field(name="Item",         value=item_name,                inline=True)
-        confirm_embed.add_field(name="Images",       value=f"{len(images_data)}",    inline=True)
-        confirm_embed.add_field(
-            name="Visibility",
-            value="This server only",
-            inline=True,
-        )
+        confirm_embed.add_field(name="Category",     value=category,              inline=True)
+        confirm_embed.add_field(name="Sub-category", value=subcategory,           inline=True)
+        confirm_embed.add_field(name="Item",         value=item_name,             inline=True)
+        confirm_embed.add_field(name="Images",       value=str(len(images_data)), inline=True)
+        confirm_embed.add_field(name="Visibility",   value="This server only",    inline=True)
         confirm_embed.set_footer(text="Press Save Puzzle to confirm, or Cancel to discard.")
 
         confirm_view = _ConfirmView()
-        confirm_msg  = await ctx.send(embed=confirm_embed, view=confirm_view)
+        confirm_msg  = await send(embed=confirm_embed, view=confirm_view)
         await confirm_view.wait()
 
         if not confirm_view.confirmed:
@@ -333,7 +322,7 @@ class AdminCog(commands.Cog):
 
         # ── Save to DB + Volume ───────────────────────────────────────────────
         try:
-            qid = await db.insert_question(guild_id, category, subcategory, item_name, ctx.author.id)
+            qid = await db.insert_question(guild_id, category, subcategory, item_name, author.id)
 
             q_dir = IMAGES_PATH / str(qid)
             q_dir.mkdir(parents=True, exist_ok=True)
@@ -348,7 +337,7 @@ class AdminCog(commands.Cog):
                     title="Puzzle Added!",
                     description=(
                         f"**{item_name}** ({category} › {subcategory})\n"
-                        f"{len(images_data)} image(s) saved to `{q_dir}`\n"
+                        f"{len(images_data)} image(s) saved.\n"
                         f"Question ID: `{qid}`"
                     ),
                     color=discord.Color.green(),
@@ -357,7 +346,7 @@ class AdminCog(commands.Cog):
             )
             log.info(
                 "Puzzle added — id=%d item=%r guild=%d by=%d images=%d",
-                qid, item_name, guild_id, ctx.author.id, len(images_data),
+                qid, item_name, guild_id, author.id, len(images_data),
             )
 
         except Exception as exc:
