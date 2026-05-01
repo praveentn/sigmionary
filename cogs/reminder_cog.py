@@ -30,6 +30,7 @@ from discord.ext import commands, tasks
 
 from utils import database as db
 from utils.categoryhistory import get_history_fact
+from cogs.game_cog import PlayNowView
 
 log = logging.getLogger("sigmionary")
 
@@ -295,8 +296,12 @@ class ReminderCog(commands.Cog):
         # Build the embed
         embed = _build_embed(fact, top_info, now_local, test)
 
+        # Build the Play Now button view (requires the GameCog to be loaded)
+        game_cog = self.bot.cogs.get("GameCog")
+        view = PlayNowView(game_cog) if game_cog else None
+
         # Paginate and send
-        await _send_paginated(channel, embed, mentions)
+        await _send_paginated(channel, embed, mentions, view=view)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -338,7 +343,7 @@ def _build_embed(
         ]
 
     lines += [
-        "👇 **Type `/sigmionary start` to play now — it only takes 5 minutes!**",
+        "👇 **Hit the button below to play now — it only takes 5 minutes!**",
         "*(Earn speed bonuses, build streaks, climb the leaderboard)*",
     ]
 
@@ -355,14 +360,15 @@ async def _send_paginated(
     channel: discord.TextChannel,
     embed: discord.Embed,
     mentions: list[str],
+    view: discord.ui.View | None = None,
 ) -> None:
     """
     Send the embed with all player mentions.  Splits into multiple messages
     when the mention string would exceed Discord's 2 000-character content limit.
-    The embed appears once in the first message; subsequent pages are plain text.
+    The embed and view appear once in the first message; subsequent pages are plain text.
     """
     if not mentions:
-        await channel.send(embed=embed)
+        await channel.send(embed=embed, view=view)
         return
 
     # Chunk mentions so each message stays under _MAX_MENTION_CHARS
@@ -383,8 +389,8 @@ async def _send_paginated(
     if current:
         pages.append(current)
 
-    # First page: mentions + embed
-    await channel.send(content=" ".join(pages[0]), embed=embed)
+    # First page: mentions + embed + view
+    await channel.send(content=" ".join(pages[0]), embed=embed, view=view)
 
     # Overflow pages: mentions only
     for page in pages[1:]:

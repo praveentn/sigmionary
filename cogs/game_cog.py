@@ -50,6 +50,98 @@ def _calc_points(hint_level: int, elapsed: float, streak: int) -> int:
     return max(1, int((base + speed_bonus) * multiplier))
 
 
+# ── Post-game UI buttons ───────────────────────────────────────────────────────
+
+class PostGameView(discord.ui.View):
+    """Buttons shown after a game ends: Play Again / My Stats / Leaderboard."""
+
+    def __init__(self, cog: "GameCog") -> None:
+        super().__init__(timeout=600)
+        self.cog = cog
+
+    @discord.ui.button(label="Play Again", style=discord.ButtonStyle.success, emoji="🎮")
+    async def play_again(self, button: discord.ui.Button, interaction: discord.Interaction) -> None:
+        state = self.cog._state(interaction.guild_id)
+        if state.active:
+            await interaction.response.send_message("A game is already running here!", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self.cog._start_game_in_channel(
+            interaction.channel, interaction.guild_id,
+            rounds=0, started_by=interaction.user.display_name, author_id=interaction.user.id,
+        )
+
+    @discord.ui.button(label="My Stats", style=discord.ButtonStyle.secondary, emoji="📊")
+    async def my_stats(self, button: discord.ui.Button, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        user  = interaction.user
+        stats = await db.get_user_stats(interaction.guild_id, user.id)
+        if not stats:
+            await interaction.followup.send("You haven't played yet — start a game to get on the board!", ephemeral=True)
+            return
+        rank = await db.get_user_rank(interaction.guild_id, user.id)
+        acc  = (
+            f"{stats['total_correct'] / stats['games_played']:.1f} correct/game"
+            if stats["games_played"] else "—"
+        )
+        embed = discord.Embed(
+            title=f"Stats — {user.display_name}",
+            color=user.color if user.color.value else discord.Color.blurple(),
+        )
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.add_field(name="Server Rank",     value=f"#{rank}",                    inline=True)
+        embed.add_field(name="Total Points",    value=f"{stats['total_points']:,}",  inline=True)
+        embed.add_field(name="Games Played",    value=str(stats["games_played"]),    inline=True)
+        embed.add_field(name="Correct Answers", value=str(stats["total_correct"]),   inline=True)
+        embed.add_field(name="Best Streak",     value=str(stats["best_streak"]),     inline=True)
+        embed.add_field(name="Avg per Game",    value=acc,                           inline=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Leaderboard", style=discord.ButtonStyle.secondary, emoji="🏆")
+    async def leaderboard(self, button: discord.ui.Button, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        rows = await db.get_leaderboard(interaction.guild_id, limit=10)
+        if not rows:
+            await interaction.followup.send("No scores yet — play a game to get on the board!", ephemeral=True)
+            return
+        medals = ["🥇", "🥈", "🥉"]
+        lines  = []
+        for i, row in enumerate(rows):
+            medal  = medals[i] if i < 3 else f"**{i + 1}.**"
+            member = interaction.guild.get_member(row["user_id"])
+            name   = member.display_name if member else f"<@{row['user_id']}>"
+            lines.append(
+                f"{medal} **{name}** — {row['total_points']:,} pts "
+                f"| {row['total_correct']} correct | best streak: {row['best_streak']} | games: {row['games_played']}"
+            )
+        embed = discord.Embed(
+            title=f"Sigmionary Leaderboard — {interaction.guild.name}",
+            description="\n".join(lines),
+            color=discord.Color.gold(),
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class PlayNowView(discord.ui.View):
+    """Single 'Play Now' button for daily reminders."""
+
+    def __init__(self, cog: "GameCog") -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(label="Play Now", style=discord.ButtonStyle.success, emoji="🎮")
+    async def play_now(self, button: discord.ui.Button, interaction: discord.Interaction) -> None:
+        state = self.cog._state(interaction.guild_id)
+        if state.active:
+            await interaction.response.send_message("A game is already running here!", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self.cog._start_game_in_channel(
+            interaction.channel, interaction.guild_id,
+            rounds=0, started_by=interaction.user.display_name, author_id=interaction.user.id,
+        )
+
+
 # ── Per-guild game state ───────────────────────────────────────────────────────
 
 @dataclass
@@ -108,9 +200,24 @@ class GameCog(commands.Cog):
             )
             return
 
+        await ctx.defer()
+        await self._start_game_in_channel(
+            ctx.channel, guild_id, rounds,
+            started_by=ctx.author.display_name, author_id=ctx.author.id,
+        )
+
+    async def _start_game_in_channel(
+        self,
+        channel: discord.TextChannel,
+        guild_id: int,
+        rounds: int,
+        started_by: str,
+        author_id: int,
+    ) -> None:
+        """Core game-start logic shared by the slash command and Play Again/Play Now buttons."""
         questions = await load_questions(guild_id)
         if not questions:
-            await ctx.respond("No questions found. Add some with the dev command or run the migration.", ephemeral=True)
+            await channel.send("No questions found. Add some with the dev command or run the migration.")
             return
 
         # ── Build unseen question pool (per-guild rotation) ───────────────────
@@ -126,9 +233,9 @@ class GameCog(commands.Cog):
         random.shuffle(unseen)
         pool = unseen[:rounds] if rounds and 0 < rounds < len(unseen) else unseen
 
-        # Initialise state
+        state                = self._state(guild_id)
         state.active         = True
-        state.channel_id     = ctx.channel_id
+        state.channel_id     = channel.id
         state.questions      = pool
         state.current_idx    = -1
         state.current_q      = None
@@ -136,7 +243,7 @@ class GameCog(commands.Cog):
         state.streaks        = {}
         state.q_answered     = False
         state.q_token        = 0
-        state.session_id     = await db.create_session(guild_id, ctx.author.id)
+        state.session_id     = await db.create_session(guild_id, author_id)
 
         fresh_note = "\n\nAll questions completed — starting a **fresh rotation**!" if fresh_start else ""
         embed = discord.Embed(
@@ -153,11 +260,11 @@ class GameCog(commands.Cog):
             ),
             color=discord.Color.gold(),
         )
-        embed.set_footer(text=f"Game started by {ctx.author.display_name}")
-        await ctx.respond(embed=embed)
+        embed.set_footer(text=f"Game started by {started_by}")
+        await channel.send(embed=embed)
 
         await asyncio.sleep(3)
-        await self._next_question(ctx.channel, guild_id)
+        await self._next_question(channel, guild_id)
 
     # /sigmionary stop ────────────────────────────────────────────────────────
 
@@ -233,7 +340,7 @@ class GameCog(commands.Cog):
         rows = await db.get_leaderboard(ctx.guild_id, limit=10)
 
         if not rows:
-            await ctx.respond("No scores recorded yet — start a game with `/sigmionary start`!")
+            await ctx.respond("No scores recorded yet — be the first to play!")
             return
 
         medals  = ["🥇", "🥈", "🥉"]
@@ -271,7 +378,7 @@ class GameCog(commands.Cog):
         stats = await db.get_user_stats(guild_id, target.id)
         if not stats:
             msg = (
-                "You haven't played yet — start a game with `/sigmionary start`!"
+                "You haven't played yet!"
                 if target == ctx.author
                 else f"**{target.display_name}** hasn't played here yet."
             )
@@ -516,7 +623,7 @@ class GameCog(commands.Cog):
             color=discord.Color.gold(),
         )
         embed.set_footer(text=f"{q_done} question(s) played")
-        await channel.send(embed=embed)
+        await channel.send(embed=embed, view=PostGameView(self))
 
         # Reset state (keeps dict entry so next game can start cleanly)
         state.active         = False
