@@ -33,6 +33,7 @@ from discord.ext import commands
 
 from utils import database as db
 from utils.database import load_questions
+from utils.external_leaderboard import post_points as _post_external_points
 from utils.fuzzy_match import guess_score, THRESHOLD_HOT, THRESHOLD_WARM
 
 log = logging.getLogger("sigmionary")
@@ -891,6 +892,15 @@ class GameCog(commands.Cog):
                 db.record_answer(
                     state.session_id, guild_id, uid, answer,
                     points, state.hint_level, elapsed, streak,
+                )
+            )
+            asyncio.create_task(
+                _post_external_points(
+                    user_id=uid,
+                    guild_id=guild_id,
+                    username=message.author.display_name,
+                    points=points,
+                    match_id=str(state.session_id),
                 )
             )
 
